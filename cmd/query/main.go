@@ -134,7 +134,7 @@ func handleQuery(
 	fmt.Println()
 
 	// Filtrar resultados con score muy bajo
-	const minScore = 0.4
+	const minScore = 0.3
 
 	filtered := results[:0]
 	for _, r := range results {

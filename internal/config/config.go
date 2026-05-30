@@ -49,6 +49,6 @@ func Default() *Config {
 		ChunkerURL:     "http://localhost:8001",
 		CacheDir:       "./data/cache",
 		DataDir:        "./data",
-		DefaultTopK:    5,
+		DefaultTopK:    10,
 	}
 }

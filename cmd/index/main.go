@@ -84,7 +84,7 @@ func main() {
 	}
 	chunks, err := chunkerClient.Chunk(ctx, chunker.ChunkRequest{
 		FilePath:  absPath,
-		Strategy:  "recursive",
+		Strategy:  "section_aware", // estrategia que intenta respetar secciones y párrafos, además de usar overlap para mejorar contexto
 		ChunkSize: *chunkSize,
 		Overlap:   *overlap,
 		DocID:     *docID,
