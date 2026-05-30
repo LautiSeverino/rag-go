@@ -69,7 +69,7 @@ async def chunk_document(req: ChunkRequest):
             # chunk_size en el request está en tokens, lo convertimos a chars
             # ~6 chars/token para español es una buena estimación
             max_chars = req.chunk_size * 6   # 512 tokens → ~3072 chars
-            overlap_chars = req.overlap * 5  # 80 tokens → ~400 chars
+            overlap_chars = req.overlap * 5  # 80 tokens → ~480 chars
             chunks = section_aware_chunk(
                 pages=pages,
                 doc_id=req.doc_id,

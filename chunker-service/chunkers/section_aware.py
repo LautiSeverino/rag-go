@@ -22,10 +22,10 @@ from extractors.pdf import PageContent
 # Heading numerado: "3. REPARTO DE PAÍSES Y OBJETIVOS"
 # También soporta sub-headings: "3.1 ALGO"
 SECTION_PATTERNS = [
-    re.compile(r'^(?:\d+\.\s+|\*\s+)[A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ0-9\s\-\(\)\.,:]+$', re.MULTILINE),
-    re.compile(r'^\d+\.\d+\s+[A-ZÁÉÍÓÚÜÑ]', re.MULTILINE),  # subsecciones
-    re.compile(r'^\d+\.\s+[A-ZÁÉÍÓÚÜÑ]', re.MULTILINE),
+    re.compile(r'^\d+\.\s+[A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ\s\-\(\)]+$', re.MULTILINE),
+    re.compile(r'^\*\s+[A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ\s\-\(\)]+$', re.MULTILINE),  # * PARTIDAS DE 2 O 3 JUGADORES
 ]
+
 # Detectar líneas de índice: "3. REPARTO DE PAÍSES . . . . 3"
 INDEX_LINE = re.compile(r'\.{2,}\s*\d+\s*$')
 
@@ -90,9 +90,8 @@ def is_index_block(text: str) -> bool:
         return False
 
     index_lines = sum(1 for l in lines if INDEX_LINE.search(l))
-    ratio = index_lines / len(lines) if lines else 0
-    page_refs = sum(1 for l in lines if re.search(r'\d+\s*$', l))   
-    return ratio > 0.30 or page_refs > len(lines) * 0.4
+    return (index_lines / len(lines)) > 0.35
+
 
 # ─── Chunker principal ────────────────────────────────────────────────────────
 
