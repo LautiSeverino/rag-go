@@ -11,7 +11,7 @@ import uvicorn
 
 from extractors.pdf import extract_text
 from chunkers.recursive import recursive_chunk
-from chunkers.section_aware import section_aware_chunk  # NUEVO
+from chunkers.section_aware import section_aware_chunk_v2  # NUEVO
 
 app = FastAPI(title="RAG Chunker Service", version="1.1.0")
 
@@ -70,11 +70,10 @@ async def chunk_document(req: ChunkRequest):
             # ~6 chars/token para español es una buena estimación
             max_chars = req.chunk_size * 6   # 512 tokens → ~3072 chars
             overlap_chars = req.overlap * 5  # 80 tokens → ~480 chars
-            chunks = section_aware_chunk(
-                pages=pages,
+            chunks = section_aware_chunk_v2(
                 doc_id=req.doc_id,
-                source=req.file_path,
                 max_chars=max_chars,
+                file_path=req.file_path,
                 overlap_chars=overlap_chars,
             )
         else:

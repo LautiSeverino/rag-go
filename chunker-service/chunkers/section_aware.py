@@ -1,51 +1,30 @@
 """
-Section-Aware Chunker — Para documentos con estructura numerada.
+Section-Aware Chunker — Reescritura completa.
 
-Detecta secciones por sus headings ("3. REPARTO DE PAÍSES Y OBJETIVOS")
-y las usa como unidades primarias de chunking. Esto garantiza que:
+Problemas del v1 que corrige:
+1. Ya no elige el patrón con más matches (estrategia incorrecta)
+2. Detecta AMBOS tipos de heading (numerados Y asterisco) simultáneamente
+3. Filtra correctamente entre headings reales vs ítems de lista
+4. No descarta contenido antes del primer heading detectado
+5. Maneja el índice inline del PDF
+6. Mergea chunks vacíos con su vecino
 
-1. El título de sección SIEMPRE está en el mismo chunk que su contenido.
-2. El INDEX/tabla de contenidos se filtra y no contamina el retrieval.
-3. Las secciones largas se dividen en sub-chunks que siempre incluyen el título.
-
-Para el TEG, Risk, UNO: funciona perfecto.
-Para el Poole (álgebra): usar hierarchical chunker (Fase 2).
+Lógica de distinción heading vs ítem de lista:
+  HEADING real:   "N. TÍTULO EN MAYÚSCULAS"  (>75% letras mayúsculas, sin puntos de índice)
+  HEADING real:   "* TÍTULO EN MAYÚSCULAS"   (>75% letras mayúsculas, sin punto al final)
+  Ítem de lista:  "1. Cada participante..."   (minúscula después del número)
+  Acción de lista: "* ATACAR países ajenos."  (minúscula mezclada, punto al final)
+  Línea de índice: "3. REPARTO . . . . . 3"   (puntos consecutivos)
 """
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
-from extractors.pdf import PageContent
+import fitz  # PyMuPDF
 
 
-# Heading numerado: "3. REPARTO DE PAÍSES Y OBJETIVOS"
-# También soporta sub-headings: "3.1 ALGO"
-SECTION_PATTERNS = [
-    re.compile(r'^\d+\.\s+[A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ\s\-\(\)]+$', re.MULTILINE),
-    re.compile(r'^\*\s+[A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ\s\-\(\)]+$', re.MULTILINE),  # * PARTIDAS DE 2 O 3 JUGADORES
-]
-
-# Detectar líneas de índice: "3. REPARTO DE PAÍSES . . . . 3"
-INDEX_LINE = re.compile(r'\.{2,}\s*\d+\s*$')
-
-
-@dataclass
-class Section:
-    number: str          # "3" o "*"
-    title: str           # "REPARTO DE PAÍSES Y OBJETIVOS"
-    content: str         # texto del contenido
-    page: int
-    char_start: int      # posición en el texto completo
-
-
-@dataclass
-class RawChunk:
-    text: str
-    page: int
-    section_title: Optional[str] = None
-    section_number: Optional[str] = None
-
+# ─── Modelos de datos ─────────────────────────────────────────────────────────
 
 @dataclass
 class ChunkMetadata:
@@ -64,176 +43,104 @@ class Chunk:
     metadata: ChunkMetadata
 
 
-# ─── Función de conteo ────────────────────────────────────────────────────────
+# ─── Patrones de detección ────────────────────────────────────────────────────
 
-def char_count(text: str) -> int:
-    """
-    Usa caracteres en lugar de tokens.
-    Es más simple, más rápido, y suficientemente preciso.
-    Regla práctica: 1500 chars ≈ 300-350 tokens para español.
-    """
-    return len(text)
+# Headings numerados: "N. TÍTULO" donde TÍTULO es dominantemente mayúscula
+# El patrón matchea cualquier carácter en el título (incluyendo dígitos como en
+# "4. DOS VUELTAS PARA AGREGAR 8 EJÉRCITOS")
+_NUMBERED = re.compile(r'^(\d+)\.\s+(.+)$', re.MULTILINE)
+
+# Headings con asterisco: "* TÍTULO" donde TÍTULO es dominantemente mayúscula
+_ASTERISK = re.compile(r'^\*\s+(.+)$', re.MULTILINE)
+
+# Líneas del índice: texto seguido de muchos puntos y un número
+_INDEX_LINE = re.compile(r'\.{3,}\s*\d+\s*$')
+
+# Contenido de publicidad/pie de documento a filtrar
+_SKIP_PATTERNS = [
+    re.compile(r'yetem\.com', re.IGNORECASE),
+    re.compile(r'App Store|Google Play', re.IGNORECASE),
+    re.compile(r'TEG Móvil|TEG JUNIOR', re.IGNORECASE),
+    re.compile(r'Si te divertiste', re.IGNORECASE),
+    re.compile(r'NEW YETEM', re.IGNORECASE),
+]
 
 
-# ─── Detección de índice ──────────────────────────────────────────────────────
+# ─── Funciones auxiliares ─────────────────────────────────────────────────────
 
-def is_index_block(text: str) -> bool:
+def _uppercase_ratio(text: str) -> float:
+    """Proporción de letras mayúsculas en el texto."""
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
+        return 0.0
+    return sum(1 for c in letters if c.isupper()) / len(letters)
+
+
+def _is_real_heading(title: str) -> bool:
     """
-    Detecta tablas de contenidos. Un bloque es índice si más del
-    35% de sus líneas tienen el patrón "texto . . . número".
-    
-    Ejemplo de línea de índice:
-    "3. REPARTO DE PAÍSES Y OBJETIVOS . . . . . . . . . 3"
+    Determina si un título es un heading real o un ítem de lista.
+
+    Criterios:
+    - Sin líneas de índice (puntos consecutivos)
+    - Título corto (< 70 chars para numbered, cualquier longitud para asterisk)
+    - Más del 75% de letras son mayúsculas
+    - No termina en punto (eso indica ítem de acción)
     """
-    lines = [l.strip() for l in text.split('\n') if l.strip()]
-    if len(lines) < 3:
+    if _INDEX_LINE.search(title):
         return False
+    if title.rstrip().endswith('.') and _uppercase_ratio(title) < 0.9:
+        # "* ATACAR países ajenos." → False
+        # "* OBJETIVO COMÚN." → True (pero este no tiene punto en el doc real)
+        return False
+    return _uppercase_ratio(title) > 0.75
 
-    index_lines = sum(1 for l in lines if INDEX_LINE.search(l))
-    return (index_lines / len(lines)) > 0.35
 
-
-# ─── Chunker principal ────────────────────────────────────────────────────────
-
-def section_aware_chunk(
-    pages: list[PageContent],
-    doc_id: str,
-    source: str,
-    max_chars: int = 2000,
-    overlap_chars: int = 300,
-) -> list[Chunk]:
-    """
-    Chunking que respeta la estructura de secciones del documento.
-
-    Args:
-        max_chars: Tamaño máximo de chunk en caracteres.
-                   2000 chars ≈ 400-500 tokens, ideal para retrieval.
-        overlap_chars: Overlap al dividir secciones largas.
-    """
-    # 1. Concatenar todo el texto del documento con marcas de página
-    page_texts = []
-    page_offsets = []  # (char_offset, page_num)
-    offset = 0
-
-    for page in pages:
-        page_offsets.append((offset, page.page_num))
-        page_texts.append(page.text)
-        offset += len(page.text) + 1
-
-    full_text = '\n'.join(page_texts)
-
-    # 2. Detectar secciones en el texto completo
-    sections = _detect_sections(full_text, page_offsets)
-
-    if not sections:
-        # Fallback: chunking simple por párrafos si no hay secciones detectadas
-        print("[section_aware] No se detectaron secciones. Usando fallback por párrafos.")
-        return _paragraph_chunk(pages, doc_id, source, max_chars, overlap_chars)
-
-    print(f"[section_aware] {len(sections)} secciones detectadas:")
-    for s in sections:
-        print(f"  [{s.number}] {s.title[:50]} — pág.{s.page}")
-
-    # 3. Generar raw chunks por sección
-    raw_chunks: list[RawChunk] = []
-
-    for section in sections:
-        # Saltar si es un bloque de índice
-        if is_index_block(section.content):
-            print(f"  ⏭ Saltando índice: {section.title[:40]}")
+def _clean_text(text: str) -> str:
+    """Limpia el texto extraído: quita números de página aislados y líneas de índice."""
+    lines = []
+    for line in text.split('\n'):
+        s = line.strip()
+        # Número de página solo (ej: "2", "11")
+        if re.match(r'^\d+$', s):
             continue
-
-        # Texto completo de la sección (título + contenido)
-        full_section = f"{section.number}. {section.title}\n\n{section.content}".strip()
-        
-        # Si la sección entra en un chunk, usarla completa
-        if char_count(full_section) <= max_chars:
-            raw_chunks.append(RawChunk(
-                text=full_section,
-                page=section.page,
-                section_title=section.title,
-                section_number=section.number,
-            ))
-        else:
-            # Sección grande: dividir manteniendo el título en cada sub-chunk
-            sub = _split_long_section(section, max_chars, overlap_chars)
-            raw_chunks.extend(sub)
-
-    if not raw_chunks:
-        return _paragraph_chunk(pages, doc_id, source, max_chars, overlap_chars)
-
-    # 4. Construir objetos Chunk con metadata completa
-    total = len(raw_chunks)
-    result = []
-    for i, rc in enumerate(raw_chunks):
-        result.append(Chunk(
-            text=rc.text,
-            metadata=ChunkMetadata(
-                doc_id=doc_id,
-                source=source,
-                page=rc.page,
-                chunk_index=i,
-                total_chunks=total,
-                section_title=rc.section_title,
-                section_number=rc.section_number,
-            )
-        ))
-
-    return result
+        # Línea del índice (ej: "3. REPARTO . . . . . 3")
+        if _INDEX_LINE.search(s):
+            continue
+        # Líneas de publicidad/pie
+        if any(p.search(s) for p in _SKIP_PATTERNS):
+            continue
+        lines.append(line)
+    return '\n'.join(lines).strip()
 
 
-# ─── Detección de secciones ───────────────────────────────────────────────────
-
-def _detect_sections(full_text: str, page_offsets: list[tuple]) -> list[Section]:
+def _detect_headings(full_text: str) -> list[tuple[int, int, str, str]]:
     """
-    Encuentra todas las secciones numeradas en el texto.
-    
-    Intenta múltiples patrones y usa el que detecta más secciones.
+    Detecta todos los headings reales en el texto completo.
+
+    Returns: list of (start_pos, end_pos, number, title)
+      number: "1"-"9" para numerados, "*" para asterisco
     """
-    best_matches = []
-    
-    for pattern in SECTION_PATTERNS:
-        matches = list(pattern.finditer(full_text))
-        if len(matches) > len(best_matches):
-            best_matches = matches
+    headings = []
 
-    if not best_matches:
-        return []
+    # Headings numerados
+    for m in _NUMBERED.finditer(full_text):
+        num = m.group(1)
+        title = m.group(2).strip()
+        if _is_real_heading(title) and len(title) < 65:
+            headings.append((m.start(), m.end(), num, title))
 
-    sections = []
-    for i, match in enumerate(best_matches):
-        # Extraer número y título
-        matched_line = match.group(0).strip()
-        
-        if matched_line.startswith('*'):
-            number = "*"
-            title = matched_line[1:].strip()
-        else:
-            dot_pos = matched_line.index('.')
-            number = matched_line[:dot_pos].strip()
-            title = matched_line[dot_pos + 1:].strip()
+    # Headings con asterisco
+    for m in _ASTERISK.finditer(full_text):
+        title = m.group(1).strip()
+        if _is_real_heading(title):
+            headings.append((m.start(), m.end(), "*", title))
 
-        # Contenido: desde el fin del heading hasta el inicio del siguiente
-        content_start = match.end()
-        content_end = best_matches[i + 1].start() if i + 1 < len(best_matches) else len(full_text)
-        content = full_text[content_start:content_end].strip()
-
-        # Determinar página
-        page = _char_to_page(match.start(), page_offsets)
-
-        sections.append(Section(
-            number=number,
-            title=title,
-            content=content,
-            page=page,
-            char_start=match.start(),
-        ))
-
-    return sections
+    headings.sort(key=lambda x: x[0])
+    return headings
 
 
-def _char_to_page(char_offset: int, page_offsets: list[tuple]) -> int:
-    """Convierte un offset de caracteres a número de página."""
+def _find_page(char_offset: int, page_offsets: list[tuple[int, int]]) -> int:
+    """Convierte un offset de caracteres al número de página."""
     page = 1
     for offset, page_num in page_offsets:
         if offset <= char_offset:
@@ -243,125 +150,285 @@ def _char_to_page(char_offset: int, page_offsets: list[tuple]) -> int:
     return page
 
 
-# ─── División de secciones largas ─────────────────────────────────────────────
+# ─── Extracción del PDF ───────────────────────────────────────────────────────
 
-def _split_long_section(
-    section: Section,
-    max_chars: int,
-    overlap_chars: int,
-) -> list[RawChunk]:
+def extract_full_text(file_path: str) -> tuple[str, list[tuple[int, int]]]:
     """
-    Divide una sección larga en sub-chunks.
-    
-    Regla: cada sub-chunk incluye el título de la sección al principio,
-    para que cualquier chunk devuelto sepa a qué sección pertenece.
+    Extrae todo el texto del PDF como un string continuo.
+
+    Returns:
+        (full_text, page_offsets)
+        page_offsets: list of (char_offset, page_number)
     """
-    header = f"{section.number}. {section.title}\n\n"
-    
-    # Intentar dividir por párrafos primero
-    paragraphs = [p.strip() for p in section.content.split('\n\n') if p.strip()]
-    
-    chunks = []
-    current_text = header
-    
-    for para in paragraphs:
-        candidate = current_text + para + '\n\n'
-        
-        if char_count(candidate) <= max_chars:
-            current_text = candidate
+    doc = fitz.open(file_path)
+    parts = []
+    page_offsets = []
+    offset = 0
+
+    for page_num in range(len(doc)):
+        text = doc[page_num].get_text("text")
+        if text.strip():
+            page_offsets.append((offset, page_num + 1))
+            parts.append(text)
+            offset += len(text)
+
+    doc.close()
+    return ''.join(parts), page_offsets
+
+
+# ─── Chunker principal ────────────────────────────────────────────────────────
+
+def section_aware_chunk_v2(
+    file_path: str,
+    doc_id: str,
+    max_chars: int = 3000,
+    overlap_chars: int = 200,
+) -> list[Chunk]:
+    """
+    Chunking basado en la estructura real del documento.
+
+    Estrategia:
+    1. Extraer el texto completo del PDF (no página por página)
+    2. Detectar todos los headings reales (numerados + asterisco)
+    3. Cada heading → un chunk con su contenido
+    4. Mergear chunks muy pequeños con su vecino
+    5. Dividir chunks muy grandes en sub-chunks por párrafos
+
+    Args:
+        file_path: Ruta al PDF
+        doc_id: Identificador del documento
+        max_chars: Tamaño máximo de chunk en caracteres (~600 chars = ~150 tokens)
+        overlap_chars: Overlap al dividir secciones largas
+    """
+    # 1. Extraer texto completo
+    full_text, page_offsets = extract_full_text(file_path)
+
+    if not full_text.strip():
+        return []
+
+    # 2. Detectar headings
+    headings = _detect_headings(full_text)
+
+    if not headings:
+        print("[section_aware_v2] No se detectaron headings. Usando fallback por párrafos.")
+        return _paragraph_fallback(full_text, page_offsets, doc_id, file_path, max_chars)
+
+    print(f"[section_aware_v2] {len(headings)} headings detectados:")
+    for _, _, num, title in headings:
+        label = f"{num}. {title}" if num != "*" else f"* {title}"
+        print(f"  {label}")
+
+    # 3. Generar raw chunks
+    raw_chunks = []
+
+    # Contenido ANTES del primer heading (si hay)
+    pre_content = _clean_text(full_text[:headings[0][0]])
+    if pre_content and len(pre_content) > 50:
+        page = _find_page(0, page_offsets)
+        raw_chunks.append({
+            "text": pre_content,
+            "page": page,
+            "title": None,
+            "number": None,
+        })
+
+    # Un chunk por heading
+    for i, (start, end, num, title) in enumerate(headings):
+        content_end = headings[i + 1][0] if i + 1 < len(headings) else len(full_text)
+        raw_content = _clean_text(full_text[end:content_end])
+
+        heading_label = f"{num}. {title}" if num != "*" else f"* {title}"
+        chunk_text = f"{heading_label}\n\n{raw_content}" if raw_content else heading_label
+
+        page = _find_page(start, page_offsets)
+
+        raw_chunks.append({
+            "text": chunk_text,
+            "page": page,
+            "title": title,
+            "number": num,
+            "content_len": len(raw_content),
+        })
+
+    # 4. Mergear chunks muy pequeños (< 60 chars de contenido)
+    merged = _merge_small_chunks(raw_chunks, min_content=60)
+
+    # 5. Dividir chunks muy grandes
+    final_raw = []
+    for chunk in merged:
+        if len(chunk["text"]) > max_chars:
+            sub = _split_large_chunk(chunk, max_chars, overlap_chars)
+            final_raw.extend(sub)
         else:
-            # Guardar chunk actual si tiene contenido más allá del header
-            if current_text.strip() != header.strip():
-                chunks.append(RawChunk(
-                    text=current_text.strip(),
-                    page=section.page,
-                    section_title=section.title,
-                    section_number=section.number,
-                ))
-                # El siguiente chunk empieza con el header + overlap del anterior
-                overlap = _get_overlap(current_text, overlap_chars)
-                current_text = header + overlap + '\n\n' + para + '\n\n'
-            else:
-                # El párrafo solo ya excede el tamaño → agregarlo de todas formas
-                # (preferible a perder contenido)
-                current_text += para + '\n\n'
-    
-    # Guardar el último chunk
-    if current_text.strip() and current_text.strip() != header.strip():
-        chunks.append(RawChunk(
-            text=current_text.strip(),
-            page=section.page,
-            section_title=section.title,
-            section_number=section.number,
+            final_raw.append(chunk)
+
+    # 6. Construir objetos Chunk con metadata
+    total = len(final_raw)
+    result = []
+    for i, rc in enumerate(final_raw):
+        result.append(Chunk(
+            text=rc["text"],
+            metadata=ChunkMetadata(
+                doc_id=doc_id,
+                source=file_path,
+                page=rc["page"],
+                chunk_index=i,
+                total_chunks=total,
+                section_title=rc.get("title"),
+                section_number=rc.get("number"),
+            )
         ))
 
-    return chunks
+    print(f"[section_aware_v2] ✓ {len(result)} chunks finales")
+    return result
 
 
-def _get_overlap(text: str, overlap_chars: int) -> str:
+# ─── Merge y split ────────────────────────────────────────────────────────────
+
+def _merge_small_chunks(
+    chunks: list[dict],
+    min_content: int = 60,
+) -> list[dict]:
     """
-    Extrae los últimos N caracteres del texto para overlap.
-    Corta en un límite de palabra/oración.
+    Mergea chunks con poco contenido con su vecino siguiente.
+    Un chunk "pequeño" es aquel cuyo contenido (sin el título) < min_content chars.
     """
-    if len(text) <= overlap_chars:
-        return text.strip()
-    
-    overlap = text[-overlap_chars:]
-    
-    # Cortar en el primer espacio para no partir palabras
-    first_space = overlap.find(' ')
-    if first_space > 0:
-        overlap = overlap[first_space:].strip()
-    
-    return overlap
+    result = []
+    i = 0
+    while i < len(chunks):
+        chunk = chunks[i]
+        content_len = chunk.get("content_len", len(chunk["text"]))
+
+        if content_len < min_content and i + 1 < len(chunks):
+            # Mergear con el siguiente
+            next_chunk = chunks[i + 1]
+            merged_text = chunk["text"] + "\n\n" + next_chunk["text"]
+            result.append({
+                "text": merged_text,
+                "page": chunk["page"],
+                "title": chunk.get("title"),
+                "number": chunk.get("number"),
+                "content_len": len(merged_text),
+            })
+            i += 2  # Saltar el siguiente (ya fue mergeado)
+        else:
+            result.append(chunk)
+            i += 1
+
+    return result
 
 
-# ─── Fallback chunking simple ─────────────────────────────────────────────────
+def _split_large_chunk(chunk: dict, max_chars: int, overlap_chars: int) -> list[dict]:
+    """
+    Divide un chunk grande en sub-chunks respetando párrafos.
+    Cada sub-chunk incluye el título de la sección al principio.
+    """
+    text = chunk["text"]
+    title = chunk.get("title")
+    number = chunk.get("number")
+    page = chunk["page"]
 
-def _paragraph_chunk(
-    pages: list[PageContent],
+    # Encontrar el header del chunk
+    header_end = text.find('\n\n')
+    if header_end == -1:
+        return [chunk]
+
+    header = text[:header_end]
+    content = text[header_end + 2:]
+
+    # Dividir por párrafos
+    paragraphs = content.split('\n\n')
+
+    sub_chunks = []
+    current = header + "\n\n"
+
+    for para in paragraphs:
+        candidate = current + para + '\n\n'
+        if len(candidate) <= max_chars:
+            current = candidate
+        else:
+            if current.strip() != header.strip():
+                sub_chunks.append({
+                    "text": current.strip(),
+                    "page": page,
+                    "title": title,
+                    "number": number,
+                    "content_len": len(current) - len(header),
+                })
+            # Nuevo sub-chunk con overlap
+            if len(current) > overlap_chars:
+                overlap = current[-overlap_chars:]
+                space = overlap.find(' ')
+                if space > 0:
+                    overlap = overlap[space:].strip()
+                current = header + "\n\n..." + overlap + "\n\n" + para + '\n\n'
+            else:
+                current = header + "\n\n" + para + '\n\n'
+
+    if current.strip() and current.strip() != header.strip():
+        sub_chunks.append({
+            "text": current.strip(),
+            "page": page,
+            "title": title,
+            "number": number,
+            "content_len": len(current) - len(header),
+        })
+
+    return sub_chunks if sub_chunks else [chunk]
+
+
+# ─── Fallback ─────────────────────────────────────────────────────────────────
+
+def _paragraph_fallback(
+    full_text: str,
+    page_offsets: list[tuple[int, int]],
     doc_id: str,
     source: str,
     max_chars: int,
-    overlap_chars: int,
 ) -> list[Chunk]:
-    """
-    Chunking simple por párrafos, usado como fallback.
-    Filtra bloques que son índices.
-    """
-    raw_chunks = []
+    """Chunking simple por párrafos, usado solo si no hay headings."""
+    paragraphs = full_text.split('\n\n')
+    chunks = []
+    current = ""
 
-    for page in pages:
-        # Filtrar páginas que son índices
-        if is_index_block(page.text):
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
             continue
+        candidate = current + para + '\n\n'
+        if len(candidate) <= max_chars:
+            current = candidate
+        else:
+            if current.strip():
+                chunks.append(current.strip())
+            current = para + '\n\n'
 
-        paragraphs = [p.strip() for p in page.text.split('\n\n') if p.strip()]
-        current = ""
+    if current.strip():
+        chunks.append(current.strip())
 
-        for para in paragraphs:
-            candidate = current + para + '\n\n'
-            if char_count(candidate) <= max_chars:
-                current = candidate
-            else:
-                if current.strip():
-                    raw_chunks.append(RawChunk(text=current.strip(), page=page.page_num))
-                current = para + '\n\n'
-
-        if current.strip():
-            raw_chunks.append(RawChunk(text=current.strip(), page=page.page_num))
-
-    total = len(raw_chunks)
+    total = len(chunks)
     return [
         Chunk(
-            text=rc.text,
+            text=text,
             metadata=ChunkMetadata(
                 doc_id=doc_id,
                 source=source,
-                page=rc.page,
+                page=1,
                 chunk_index=i,
                 total_chunks=total,
             )
         )
-        for i, rc in enumerate(raw_chunks)
+        for i, text in enumerate(chunks)
     ]
+
+
+# ─── Interfaz para el servicio HTTP ──────────────────────────────────────────
+
+def chunk_from_file(
+    file_path: str,
+    doc_id: str,
+    max_chars: int = 3000,
+    overlap_chars: int = 200,
+) -> list[Chunk]:
+    """Punto de entrada principal para el servicio HTTP."""
+    return section_aware_chunk_v2(file_path, doc_id, max_chars, overlap_chars)
