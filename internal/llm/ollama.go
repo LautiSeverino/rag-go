@@ -139,21 +139,39 @@ func (c *Client) GenerateStream(ctx context.Context, prompt string) (<-chan stri
 func BuildPrompt(question string, chunks []SearchChunk) string {
 	var sb strings.Builder
 
-	sb.WriteString("Respondé la pregunta usando ÚNICAMENTE la información del contexto proporcionado.\n")
-	sb.WriteString("Si la respuesta no está en el contexto, decí exactamente: \"No encontré esa información en los documentos.\"\n")
-	sb.WriteString("Cuando uses información de un fragmento, citá su número entre corchetes, ej: [1], [2].\n")
-	sb.WriteString("Respondé en el mismo idioma de la pregunta.\n\n")
+	sb.WriteString(`Eres un asistente experto en responder preguntas basándote ÚNICAMENTE en el contexto proporcionado.
+
+REGLAS ESTRICTAS:
+1. Responde SOLO usando información del CONTEXTO proporcionado
+2. NUNCA inventes, supongas o agregues información externa
+3. Responde en el MISMO IDIOMA de la PREGUNTA
+   - Pregunta en español → respuesta en español
+   - Pregunta en inglés → respuesta en inglés
+4. Si el contexto tiene información dispersa en varios fragmentos, combínala de forma coherente
+5. Si la pregunta pide "cómo" o un proceso paso a paso, incluye TODOS los pasos mencionados en el contexto
+6. Si NO HAY información suficiente, responde: "No tengo suficiente información en el contexto para responder esta pregunta."
+7. Sé preciso, completo y detallado. No omitas pasos ni información relevante.
+8. Usa SOLO datos del contexto
+9. Cuando uses información de un fragmento, cita su número entre corchetes, por ejemplo: [1], [2], [3]
+
+`)
 
 	sb.WriteString("--- CONTEXTO ---\n\n")
+
 	for _, chunk := range chunks {
-		sb.WriteString(fmt.Sprintf("[%d] (Fuente: %s, página %d)\n", chunk.Index, chunk.Source, chunk.Page))
+		sb.WriteString(fmt.Sprintf(
+			"[%d] (Fuente: %s, página %d)\n",
+			chunk.Index,
+			chunk.Source,
+			chunk.Page,
+		))
 		sb.WriteString(chunk.Text)
 		sb.WriteString("\n\n")
 	}
 
 	sb.WriteString("--- FIN DEL CONTEXTO ---\n\n")
-	sb.WriteString(fmt.Sprintf("Pregunta: %s\n\n", question))
-	sb.WriteString("Respuesta:")
+	sb.WriteString(fmt.Sprintf("PREGUNTA: %s\n\n", question))
+	sb.WriteString("RESPUESTA:")
 
 	return sb.String()
 }

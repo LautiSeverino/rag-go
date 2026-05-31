@@ -9,7 +9,8 @@ const (
 type LLMModel string
 
 const (
-	LLMModelQwen25 LLMModel = "qwen2.5:7b-instruct"
+	LLMModelQwen25_7B LLMModel = "qwen2.5:7b-instruct"
+	LLMModelQwen25_3B LLMModel = "qwen2.5:3b"
 )
 
 // Config centraliza toda la configuración del sistema RAG.
@@ -41,7 +42,7 @@ func Default() *Config {
 	return &Config{
 		OllamaURL:      "http://localhost:11434",
 		EmbedModel:     "nomic-embed-text",
-		LLMModel:       "qwen2.5:7b-instruct",
+		LLMModel:       LLMModelQwen25_3B,
 		QdrantHost:     "localhost",
 		QdrantPort:     6334,
 		CollectionName: "rag_docs",

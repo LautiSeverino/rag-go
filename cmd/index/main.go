@@ -1,9 +1,6 @@
-// cmd/index es el comando para indexar un PDF en el sistema RAG.
-//
-// Uso:
-//
-//	go run ./cmd/index -file riesgo.pdf
-//	go run ./cmd/index -file poole.pdf -id poole-algebra -chunk-size 512 -overlap 80
+// cmd/index/main.go — Con BM25 index generation
+// REEMPLAZAR main.go existente con este contenido
+
 package main
 
 import (
@@ -14,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"rag-go/data/cache"
+	"rag-go/internal/bm25"
 	"rag-go/internal/chunker"
 	"rag-go/internal/config"
 	"rag-go/internal/embed"
@@ -26,34 +24,30 @@ import (
 func main() {
 	filePath := flag.String("file", "", "Ruta al PDF a indexar (requerido)")
 	docID := flag.String("id", "", "ID del documento (default: nombre del archivo)")
-	chunkSize := flag.Int("chunk-size", 512, "Tamaño de chunk en tokens")
-	overlap := flag.Int("overlap", 80, "Overlap entre chunks en tokens")
+	chunkSize := flag.Int("chunk-size", 512, "Tamaño de chunk")
+	overlap := flag.Int("overlap", 80, "Overlap entre chunks")
+	strategy := flag.String("strategy", "section_aware", "Estrategia de chunking: section_aware | recursive")
 	flag.Parse()
 
 	if *filePath == "" {
-		fmt.Fprintln(os.Stderr, "Error: -file es requerido")
 		fmt.Fprintln(os.Stderr, "Uso: go run ./cmd/index -file documento.pdf")
 		os.Exit(1)
 	}
-
 	if *docID == "" {
 		*docID = filepath.Base(*filePath)
 	}
 
 	cfg := config.Default()
 	ctx := context.Background()
-
 	start := time.Now()
+
 	fmt.Printf("📄 Indexando: %s (id: %s)\n", *filePath, *docID)
 	fmt.Println()
 
-	// --- Inicializar componentes ---
-
+	// Inicializar componentes
 	chunkerClient := chunker.NewClient(cfg.ChunkerURL)
-
-	// Verificar que el servicio Python esté corriendo
 	if err := chunkerClient.HealthCheck(ctx); err != nil {
-		log.Fatalf("❌ %v\n   Corré: cd chunker-service && python main.py", err)
+		log.Fatalf("❌ Chunker service: %v\n   Corré: cd chunker-service && python main.py", err)
 	}
 
 	embedder := embed.New(cfg.OllamaURL, cfg.EmbedModel)
@@ -66,25 +60,19 @@ func main() {
 
 	qdrantStore, err := store.New(cfg.QdrantHost, cfg.QdrantPort, cfg.CollectionName, cfg.VectorDims)
 	if err != nil {
-		log.Fatalf("❌ Qdrant: %v\n   ¿Está corriendo? docker run -p 6333:6333 -p 6334:6334 qdrant/qdrant", err)
+		log.Fatalf("❌ Qdrant: %v", err)
 	}
-
 	if err := qdrantStore.EnsureCollection(ctx); err != nil {
-		log.Fatalf("❌ Crear colección: %v", err)
+		log.Fatalf("❌ Colección: %v", err)
 	}
 
-	// --- Paso 1: Chunking via Python service ---
-
-	fmt.Printf("🔪 Chunking... (chunk_size=%d, overlap=%d)\n", *chunkSize, *overlap)
+	// --- Paso 1: Chunking ---
+	fmt.Printf("🔪 Chunking... (strategy=%s, chunk_size=%d, overlap=%d)\n", *strategy, *chunkSize, *overlap)
 	chunkStart := time.Now()
 
-	absPath, err := filepath.Abs(*filePath)
-	if err != nil {
-		log.Fatalf("❌ Resolver ruta absoluta: %v", err)
-	}
 	chunks, err := chunkerClient.Chunk(ctx, chunker.ChunkRequest{
-		FilePath:  absPath,
-		Strategy:  "section_aware", // estrategia que intenta respetar secciones y párrafos, además de usar overlap para mejorar contexto
+		FilePath:  *filePath,
+		Strategy:  *strategy,
 		ChunkSize: *chunkSize,
 		Overlap:   *overlap,
 		DocID:     *docID,
@@ -92,31 +80,21 @@ func main() {
 	if err != nil {
 		log.Fatalf("❌ Chunking: %v", err)
 	}
-
 	fmt.Printf("   ✓ %d chunks en %.1fs\n\n", len(chunks), time.Since(chunkStart).Seconds())
 
-	for _, chunk := range chunks {
-		fmt.Printf(
-			"chunk=%d page=%d len=%d\n",
-			chunk.Metadata.ChunkIndex,
-			chunk.Metadata.Page,
-			len(chunk.Text),
-		)
-	}
-
-	// --- Paso 2: Embeddings con cache ---
-
-	fmt.Printf("🔢 Generando embeddings con %s...\n", cfg.EmbedModel)
+	// --- Paso 2: Embeddings + BM25 prep ---
+	fmt.Printf("🔢 Embeddings con %s...\n", cfg.EmbedModel)
 	embedStart := time.Now()
 
 	cacheHits := 0
 	points := make([]store.Point, 0, len(chunks))
+	bm25Docs := make([]struct{ ID, Text string }, 0, len(chunks))
 
 	for i, chunk := range chunks {
+		chunkUUID := uuid.New().String()
 		hash := cache.HashText(chunk.Text)
 
 		var embedding []float32
-
 		if emb, ok := embCache.Get(hash); ok {
 			embedding = emb
 			cacheHits++
@@ -125,14 +103,12 @@ func main() {
 			if err != nil {
 				log.Fatalf("❌ Embed chunk %d: %v", i, err)
 			}
-			if err := embCache.Set(hash, emb); err != nil {
-				log.Printf("⚠️  No se pudo cachear chunk %d: %v", i, err)
-			}
+			embCache.Set(hash, emb)
 			embedding = emb
 		}
 
 		points = append(points, store.Point{
-			ID:     uuid.New().String(),
+			ID:     chunkUUID,
 			Vector: embedding,
 			Payload: map[string]any{
 				"text":        chunk.Text,
@@ -143,46 +119,58 @@ func main() {
 			},
 		})
 
-		// Mostrar progreso cada 20 chunks
-		if (i+1)%20 == 0 || i+1 == len(chunks) {
-			cacheRate := float64(cacheHits) / float64(i+1) * 100
+		// Guardar para BM25 (misma UUID que en Qdrant)
+		bm25Docs = append(bm25Docs, struct{ ID, Text string }{
+			ID:   chunkUUID,
+			Text: chunk.Text,
+		})
+
+		if (i+1)%10 == 0 || i+1 == len(chunks) {
 			fmt.Printf("   [%d/%d] cache hits: %d (%.0f%%)\n",
-				i+1, len(chunks), cacheHits, cacheRate)
+				i+1, len(chunks), cacheHits,
+				float64(cacheHits)/float64(i+1)*100)
 		}
 	}
 
-	fmt.Printf("   ✓ Embeddings en %.1fs (cache hits: %d/%d)\n\n",
-		time.Since(embedStart).Seconds(), cacheHits, len(chunks))
+	fmt.Printf("   ✓ %.1fs (cache: %d/%d)\n\n", time.Since(embedStart).Seconds(), cacheHits, len(chunks))
 
-	// --- Paso 3: Upsert en Qdrant por batches ---
-
+	// --- Paso 3: Upsert en Qdrant ---
 	fmt.Println("📤 Guardando en Qdrant...")
-	qdrantStart := time.Now()
-
 	const batchSize = 50
 	for i := 0; i < len(points); i += batchSize {
-		end := min(i+batchSize, len(points))
+		end := i + batchSize
+		if end > len(points) {
+			end = len(points)
+		}
 		if err := qdrantStore.Upsert(ctx, points[i:end]); err != nil {
-			log.Fatalf("❌ Upsert batch %d-%d: %v", i, end, err)
+			log.Fatalf("❌ Upsert: %v", err)
 		}
 	}
+	qdrantStore.CreatePayloadIndex(ctx, "doc_id")
+	fmt.Println("   ✓ Guardado")
 
-	// Crear índice en doc_id para que los filtros sean rápidos
-	_ = qdrantStore.CreatePayloadIndex(ctx, "doc_id")
+	// --- Paso 4: Construir y guardar índice BM25 ---
+	fmt.Println("📑 Construyendo índice BM25...")
+	bm25Idx := bm25.Build(bm25Docs, *docID)
 
-	fmt.Printf("   ✓ Guardado en %.1fs\n\n", time.Since(qdrantStart).Seconds())
+	bm25Dir := filepath.Join(cfg.DataDir, "bm25")
+	os.MkdirAll(bm25Dir, 0755)
+	bm25Path := filepath.Join(bm25Dir, *docID+".json")
+
+	if err := bm25Idx.Save(bm25Path); err != nil {
+		log.Printf("⚠️  No se pudo guardar índice BM25: %v", err)
+	} else {
+		fmt.Printf("   ✓ Índice BM25 guardado: %s\n", bm25Path)
+	}
 
 	// --- Resumen ---
-
-	total := time.Since(start)
+	fmt.Println()
 	fmt.Println("─────────────────────────────────────")
 	fmt.Printf("✅ Indexado completado\n")
 	fmt.Printf("   Documento : %s\n", *docID)
 	fmt.Printf("   Chunks    : %d\n", len(chunks))
-	fmt.Printf("   Cache hits: %d/%d (%.0f%%)\n",
-		cacheHits, len(chunks), float64(cacheHits)/float64(len(chunks))*100)
-	fmt.Printf("   Tiempo    : %.1fs\n", total.Seconds())
+	fmt.Printf("   Cache hits: %d/%d\n", cacheHits, len(chunks))
+	fmt.Printf("   Tiempo    : %.1fs\n", time.Since(start).Seconds())
 	fmt.Println("─────────────────────────────────────")
-	fmt.Printf("\nListo para consultar:\n")
-	fmt.Printf("  go run ./cmd/query -doc %s\n", *docID)
+	fmt.Printf("\nConsultar:\n  go run ./cmd/query -doc %s\n", *docID)
 }

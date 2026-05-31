@@ -54,7 +54,7 @@ _NUMBERED = re.compile(r'^(\d+)\.\s+(.+)$', re.MULTILINE)
 _ASTERISK = re.compile(r'^\*\s+(.+)$', re.MULTILINE)
 
 # Líneas del índice: texto seguido de muchos puntos y un número
-_INDEX_LINE = re.compile(r'\.{3,}\s*\d+\s*$')
+_INDEX_LINE = re.compile(r'(\.\s*){3,}\d+\s*$')
 
 # Contenido de publicidad/pie de documento a filtrar
 _SKIP_PATTERNS = [
