@@ -42,9 +42,6 @@ type generateResponse struct {
 	Done     bool   `json:"done"`
 }
 
-const temperature = 0.1 // Baja temperatura para respuestas más precisas en RAG
-const numCtx = 4096     // Ventana de contexto amplia para manejar prompts largos con mucho contexto
-
 // GenerateStream envía el prompt a Ollama y devuelve dos canales:
 //   - tokenCh: recibe los tokens a medida que se generan (para imprimir en tiempo real)
 //   - errCh: recibe un error si algo falla, nil si todo salió bien
@@ -63,8 +60,11 @@ func (c *Client) GenerateStream(ctx context.Context, prompt string) (<-chan stri
 			Prompt: prompt,
 			Stream: true,
 			Options: map[string]any{
-				"temperature": temperature, // Baja temperatura para respuestas más precisas en RAG
-				"num_ctx":     numCtx,      // Ventana de contexto
+				"temperature":    0.0, // 0 = completamente determinista, sin creatividad
+				"num_ctx":        4096,
+				"num_predict":    512, // limitar longitud: respuestas cortas y precisas
+				"top_p":          0.9,
+				"repeat_penalty": 1.1,
 			},
 		}
 
@@ -75,7 +75,7 @@ func (c *Client) GenerateStream(ctx context.Context, prompt string) (<-chan stri
 		}
 
 		req, err := http.NewRequestWithContext(
-			ctx, http.MethodPost, c.baseURL+"/api/generate", bytes.NewReader(body),
+			ctx, "POST", c.baseURL+"/api/generate", bytes.NewReader(body),
 		)
 		if err != nil {
 			errCh <- fmt.Errorf("crear request: %w", err)
@@ -129,49 +129,35 @@ func (c *Client) GenerateStream(ctx context.Context, prompt string) (<-chan stri
 	return tokenCh, errCh
 }
 
-// BuildPrompt construye el prompt RAG con el contexto recuperado.
+// BuildPrompt construye el prompt RAG con instrucciones estrictas de grounding.
 //
-// El diseño del prompt es importante:
-//   - Instruye al modelo a responder SOLO con el contexto dado
-//   - Pide que cite el número de fragmento cuando usa info de él
-//   - Pide que diga "no tengo esa información" si no está en el contexto
-//     (evita alucinaciones)
+// Diseño del prompt:
+// - Instrucción clara de SOLO usar el contexto dado
+// - Prohibición explícita de agregar información propia
+// - Para listas/enumeraciones: copiar exactamente del documento
+// - Frase de fallback exacta cuando la info no está
 func BuildPrompt(question string, chunks []SearchChunk) string {
 	var sb strings.Builder
 
-	sb.WriteString(`Eres un asistente experto en responder preguntas basándote ÚNICAMENTE en el contexto proporcionado.
-
-REGLAS ESTRICTAS:
-1. Responde SOLO usando información del CONTEXTO proporcionado
-2. NUNCA inventes, supongas o agregues información externa
-3. Responde en el MISMO IDIOMA de la PREGUNTA
-   - Pregunta en español → respuesta en español
-   - Pregunta en inglés → respuesta en inglés
-4. Si el contexto tiene información dispersa en varios fragmentos, combínala de forma coherente
-5. Si la pregunta pide "cómo" o un proceso paso a paso, incluye TODOS los pasos mencionados en el contexto
-6. Si NO HAY información suficiente, responde: "No tengo suficiente información en el contexto para responder esta pregunta."
-7. Sé preciso, completo y detallado. No omitas pasos ni información relevante.
-8. Usa SOLO datos del contexto
-9. Cuando uses información de un fragmento, cita su número entre corchetes, por ejemplo: [1], [2], [3]
-
-`)
+	sb.WriteString("Sos un asistente que responde preguntas basándose EXCLUSIVAMENTE en el contexto dado.\n\n")
+	sb.WriteString("REGLAS ESTRICTAS:\n")
+	sb.WriteString("1. Usá SOLO la información que aparece textualmente en el contexto.\n")
+	sb.WriteString("2. NO agregues información propia, suposiciones ni elaboraciones.\n")
+	sb.WriteString("3. Si la pregunta pide una lista o enumeración, copiá exactamente los elementos del contexto.\n")
+	sb.WriteString("4. Si la información no está en el contexto, respondé exactamente: \"No encontré esa información en los documentos.\"\n")
+	sb.WriteString("5. Citá el número de fragmento al usar información de él, ej: [1], [2].\n")
+	sb.WriteString("6. Respondé en el mismo idioma de la pregunta.\n\n")
 
 	sb.WriteString("--- CONTEXTO ---\n\n")
-
 	for _, chunk := range chunks {
-		sb.WriteString(fmt.Sprintf(
-			"[%d] (Fuente: %s, página %d)\n",
-			chunk.Index,
-			chunk.Source,
-			chunk.Page,
-		))
+		sb.WriteString(fmt.Sprintf("[%d] (Fuente: %s, página %d)\n", chunk.Index, chunk.Source, chunk.Page))
 		sb.WriteString(chunk.Text)
 		sb.WriteString("\n\n")
 	}
 
 	sb.WriteString("--- FIN DEL CONTEXTO ---\n\n")
-	sb.WriteString(fmt.Sprintf("PREGUNTA: %s\n\n", question))
-	sb.WriteString("RESPUESTA:")
+	sb.WriteString(fmt.Sprintf("Pregunta: %s\n\n", question))
+	sb.WriteString("Respuesta (basada únicamente en el contexto):")
 
 	return sb.String()
 }

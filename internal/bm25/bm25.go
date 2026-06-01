@@ -148,7 +148,7 @@ func Build(docs []struct{ ID, Text string }, docID string) *Index {
 	// IDF = log((N - df + 0.5) / (df + 0.5) + 1)
 	idf := make(map[string]float64, len(dfCount))
 	for term, df := range dfCount {
-		idf[term] = math.Log(float64(n-df)+0.5)/float64(df+1) + 1
+		idf[term] = math.Log((float64(n-df)+0.5)/float64(df+1)) + 1
 		if idf[term] < 0 {
 			idf[term] = 0.01 // Evitar IDF negativo
 		}
@@ -210,17 +210,16 @@ func (idx *Index) SearchAll(query string, topK int) []struct {
 	ID    string
 	Score float64
 } {
-	scores := make([]struct {
+	type scored struct {
 		ID    string
 		Score float64
-	}, 0, len(idx.Docs))
+	}
+
+	scores := make([]scored, 0, len(idx.Docs))
 	for _, doc := range idx.Docs {
 		s := idx.Score(doc.ID, query)
 		if s > 0 {
-			scores = append(scores, struct {
-				ID    string
-				Score float64
-			}{ID: doc.ID, Score: s})
+			scores = append(scores, scored{ID: doc.ID, Score: s})
 		}
 	}
 
@@ -236,7 +235,15 @@ func (idx *Index) SearchAll(query string, topK int) []struct {
 	if topK > len(scores) {
 		topK = len(scores)
 	}
-	return scores[:topK]
+	result := make([]struct {
+		ID    string
+		Score float64
+	}, topK)
+	for i := 0; i < topK; i++ {
+		result[i].ID = scores[i].ID
+		result[i].Score = scores[i].Score
+	}
+	return result
 }
 
 // RRFScore calcula el score Reciprocal Rank Fusion para un rank dado.
@@ -273,8 +280,6 @@ func FuseResults(
 				DenseScore: r.DenseScore,
 				DenseRank:  i,
 				RRFScore:   RRFScore(i),
-				Source:     r.Source,
-				Page:       r.Page,
 			}
 		}
 		return results[:min(finalK, len(results))]
@@ -409,8 +414,6 @@ func FuseResults(
 			DenseRank:  r.DenseRank,
 			BM25Rank:   r.BM25Rank,
 			RRFScore:   r.RRFScore,
-			Source:     info.Source,
-			Page:       info.Page,
 		}
 	}
 
